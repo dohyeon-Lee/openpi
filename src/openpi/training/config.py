@@ -761,6 +761,19 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="pi05_libero_base",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+        ),
+    ),
     #
     # Fine-tuning Aloha configs.
     #
