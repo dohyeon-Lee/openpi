@@ -25,7 +25,14 @@ from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
-
+from robot_kinematics import (
+    MujocoKinematics,
+    diff_ik_trajectory,
+    extract_diff_ik_inputs,
+    print_diff_ik_inputs,
+    save_ik_verification_plot,
+)
+from toppra_viz import JointToppraPlanner
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
@@ -33,7 +40,7 @@ LIBERO_ENV_RESOLUTION = 256
 
 @dataclasses.dataclass
 class Args:
-    host: str = "10.1.1.19"
+    host: str = "172.20.1.100"
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5
@@ -119,8 +126,13 @@ def render_chunk_overlay(robot_img, predicted_eef, current_eef, sim, cam_name, s
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb):
-    """x/y/z별로 시간축 그래프: 실제 EEF + chunk 예측 오버레이."""
+def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb,
+                              toppra_predictions=None):
+    """x/y/z별로 시간축 그래프: 실제 EEF + chunk 예측 + TOPP-RA 오버레이.
+
+    toppra_predictions : list of (start_step, eef_smooth)
+                         eef_smooth = (M, 3) or None (toppra 미설치 시)
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -128,38 +140,49 @@ def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb):
     actual = np.array(actual_eef)
     n_steps = len(actual)
     labels = ["x", "y", "z"]
-    colors = ["r", "g", "b"]
+    actual_colors = ["r", "g", "b"]
+    chunk_colors  = ["orange", "limegreen", "deepskyblue"]
+    toppra_colors = ["darkorange", "darkgreen", "dodgerblue"]
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
 
-    for dim, (ax, label, color) in enumerate(zip(axes, labels, colors)):
-        # 실제 경로
-        ax.plot(range(n_steps), actual[:, dim], color=color, linewidth=2, label="actual")
+    for dim, (ax, label, ac, cc, tc) in enumerate(
+        zip(axes, labels, actual_colors, chunk_colors, toppra_colors)
+    ):
+        # ── 실제 EEF ──────────────────────────────────────────────────────────
+        ax.plot(range(n_steps), actual[:, dim], color=ac, linewidth=2, label="actual")
 
-        # chunk 예측들
-        for i, (start_step, start_pos, chunk) in enumerate(chunk_predictions):
+        # ── IK-based chunk 예측 ───────────────────────────────────────────────
+        for i, (start_step, _, chunk) in enumerate(chunk_predictions):
             t_range = list(range(start_step, start_step + len(chunk)))
-            ax.plot(t_range, chunk[:, dim], color=color, alpha=0.3, linewidth=1,
-                    linestyle="--", label="chunk" if i == 0 else None)
+            ax.plot(t_range, chunk[:, dim], color=cc, alpha=0.5, linewidth=1,
+                    linestyle="-", label="chunk" if i == 0 else None)
 
-            # 다음 replan 시점에 이 chunk의 예측값과 실제값 비교점 찍기
             if i + 1 < len(chunk_predictions):
                 next_step, next_pos, _ = chunk_predictions[i + 1]
                 idx = next_step - start_step
                 if 0 <= idx < len(chunk):
-                    # 이전 chunk의 예측값 (x 마커)
-                    ax.scatter(next_step, chunk[idx, dim], color=color, s=30, marker="x", zorder=5,
+                    ax.scatter(next_step, chunk[idx, dim], color=cc, s=30, marker="x", zorder=5,
                                label="chunk pred at replan" if i == 0 else None)
-                    # 실제 EEF 위치 (채운 원)
-                    ax.scatter(next_step, next_pos[dim], color=color, s=40, zorder=5,
+                    ax.scatter(next_step, next_pos[dim], color=ac, s=40, zorder=5,
                                label="actual at replan" if i == 0 else None)
 
+        # ── TOPP-RA smoothed (dotted) ─────────────────────────────────────────
+        if toppra_predictions:
+            for i, (start_step, eef_smooth) in enumerate(toppra_predictions):
+                if eef_smooth is None:
+                    continue
+                t_range = list(range(start_step, start_step + len(eef_smooth)))
+                ax.plot(t_range, eef_smooth[:, dim], color=tc, alpha=0.8, linewidth=1.5,
+                        linestyle=":", label="toppra" if i == 0 else None)
+
         ax.set_ylabel(label)
-        ax.legend(loc="upper right")
+        ax.legend(loc="upper right", fontsize=7)
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel("timestep")
-    fig.suptitle(f"EEF Trajectory over Time (trial {trial})")
+    fig.suptitle(f"EEF Trajectory over Time (trial {trial})\n"
+                 "solid=chunk(IK)  dotted=TOPP-RA smoothed")
     fig.tight_layout()
 
     out_path = pathlib.Path("videos") / f"traj_time_trial{trial}.png"
@@ -177,7 +200,7 @@ def save_3d_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa
+    import mpl_toolkits.mplot3d  # noqa: F401 — registers 3d projection
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
@@ -276,15 +299,14 @@ def main(args: Args):
     print(f"  type        : {type(robot.robot_model).__name__}")
     print(f"  dof         : {robot.dof}")
     print(f"  torque_limits: {robot.torque_limits}")
-    # Franka Panda real max joint velocities (rad/s)
-    panda_vel_limits = [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
-    print(f"  vel_limits   : {panda_vel_limits}  (Franka Panda spec, rad/s)")
     print(f"==================\n")
 
     initial_states = task_suite.get_task_init_states(selected_task_id)
 
     # --- connect to policy server ---
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    ctrl_freq = env.env.control_freq
+    toppra_planner = JointToppraPlanner(controller_freq=ctrl_freq)
 
     joint_names = [f"j{i}" for i in range(7)]
     header = (
@@ -300,11 +322,14 @@ def main(args: Args):
         print(f"\n--- Trial {trial+1}/{args.num_trials} ---")
         env.reset()
         obs = env.set_init_state(initial_states[trial % len(initial_states)])
+
         action_plan = collections.deque()
         frames = []  # for robot video
         chunk_frames = []  # for chunk visualization video
         actual_eef = []  # actual EEF positions per step
-        chunk_predictions = []  # (start_pos, predicted_eef) per replan
+        chunk_predictions = []  # (start_step, start_pos, predicted_eef) per replan
+        ik_records = []         # (start_step, x_traj, fk_check) per replan
+        toppra_predictions = [] # (start_step, eef_smooth) per replan
         t = 0
 
         while t < args.max_steps + args.num_steps_wait:
@@ -375,6 +400,38 @@ def main(args: Args):
 
                 action_plan.extend(action_chunk[:args.replan_steps])
 
+                # Diff IK 검증: chunk EEF → joint → FK 복원
+                kin = MujocoKinematics(env.env.robots[0])
+                q0, x_traj, R_traj, dt = extract_diff_ik_inputs(obs, action_chunk, env.env.robots[0], ctrl_freq)
+                if step == 0:
+                    print_diff_ik_inputs(q0, x_traj, R_traj, dt)
+                q_waypoints = diff_ik_trajectory(q0, x_traj, R_traj, dt, kin)
+                fk_check = np.array([kin.fk_pos(q) for q in q_waypoints])
+                ik_err = np.abs(fk_check - x_traj)
+                print(f"  [IK err] max={ik_err.max(axis=0).round(4)}  mean={ik_err.mean(axis=0).round(4)}")
+                ik_records.append((step, x_traj, fk_check))
+
+                # joint velocity clamp: TOPP-RA 입력 전 한계 초과 waypoint 보정
+                qdot = np.diff(q_waypoints, axis=0) * ctrl_freq        # (T-1, 7) rad/s
+                scale = np.max(np.abs(qdot) / toppra_planner.vel_limits, axis=1, keepdims=True)  # (T-1, 1)
+                scale = np.maximum(scale, 1.0)                          # 한계 이내는 그대로
+                q_waypoints_clamped = q_waypoints.copy()
+                for i in range(1, len(q_waypoints)):
+                    q_waypoints_clamped[i] = q_waypoints_clamped[i - 1] + (
+                        q_waypoints[i] - q_waypoints[i - 1]
+                    ) / scale[i - 1, 0]
+
+                # TOPP-RA: joint waypoints → velocity/accel-constrained smooth EEF trajectory
+                if step == 0:
+                    print(f"  [TOPP-RA] q_waypoints shape: {q_waypoints.shape}")
+                    qdot = np.diff(q_waypoints, axis=0) * ctrl_freq  # rad/s
+                    print(f"  [TOPP-RA] max joint vel: {np.abs(qdot).max(axis=0).round(3)}")
+                    print(f"  [TOPP-RA] panda vel lim: {toppra_planner.vel_limits.round(3)}")
+                eef_smooth = toppra_planner.plan(q_waypoints_clamped, fk_pos=kin.fk_pos, inv_dyn=kin.inv_dyn)
+                if step == 0 and eef_smooth is not None:
+                    print(f"  [TOPP-RA] eef_smooth shape: {eef_smooth.shape}  (원본 T={q_waypoints.shape[0]})")
+                toppra_predictions.append((step, eef_smooth))
+
             action = action_plan.popleft()
             obs, _, done, _ = env.step(action.tolist())
             t += 1
@@ -408,7 +465,10 @@ def main(args: Args):
 
         if actual_eef:
             save_3d_trajectory_plot(actual_eef, chunk_predictions, trial, args.use_wandb)
-            save_time_trajectory_plot(actual_eef, chunk_predictions, trial, args.use_wandb)
+            save_time_trajectory_plot(actual_eef, chunk_predictions, trial, args.use_wandb,
+                                      toppra_predictions=toppra_predictions)
+            if ik_records:
+                save_ik_verification_plot(ik_records, trial, use_wandb=args.use_wandb)
 
     env.close()
 
