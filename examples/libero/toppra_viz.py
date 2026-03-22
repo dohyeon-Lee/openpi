@@ -81,7 +81,7 @@ class JointToppraPlanner:
                      or None if toppra unavailable / computation fails.
         """
         if not self._available:
-            return None
+            return None, None
 
         from toppra.interpolator import SplineInterpolator
         from toppra.algorithm import TOPPRA
@@ -145,7 +145,7 @@ class JointToppraPlanner:
 
         if traj is None:
             logger.warning("TOPP-RA returned None trajectory")
-            return None
+            return None, None
 
         # ── sample at controller_freq ──────────────────────────────────────────
         num_ts = max(int(np.ceil(traj.duration * self.controller_freq)), 1)
