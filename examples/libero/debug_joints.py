@@ -50,7 +50,7 @@ class Args:
     task_keyword: str = ""          # filter tasks whose description contains this string (case-insensitive). empty = first task
     num_steps_wait: int = 10
     num_trials: int = 1             # how many rollouts to run (was 50 per task)
-    max_steps: int = 100            # cap per episode
+    max_steps: int = 150            # cap per episode
 
     # ── 실행 모드 ──────────────────────────────────────────────────────────────
     # osc_chunk   : 원래 방식 — policy chunk를 OSC로 그대로 실행 (TOPP-RA는 시각화만)
