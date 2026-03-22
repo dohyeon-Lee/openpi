@@ -2,7 +2,7 @@
 
 import tensorflow_datasets as tfds
 
-DATA_DIR = "/scratch/mdorazi/libero_rlds"
+DATA_DIR = "/data2/dohyeon/libero_data"
 DATASET_NAME = "libero_spatial_no_noops"
 
 ds = tfds.load(DATASET_NAME, data_dir=DATA_DIR, split="train")
