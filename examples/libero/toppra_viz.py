@@ -136,13 +136,12 @@ class JointToppraPlanner:
         sd_start = _qdot_to_sd(qdot_start, ts[0])
         sd_end   = _qdot_to_sd(qdot_end,   ts[-1])
 
-        instance = TOPPRA(constraints, path, parametrizer="ParametrizeConstAccel")
-
         try:
+            instance = TOPPRA(constraints, path, parametrizer="ParametrizeConstAccel")
             traj = instance.compute_trajectory(sd_start, sd_end)
         except Exception as exc:
-            logger.warning("TOPP-RA solver failed: %s", exc)
-            return None
+            logger.warning("TOPP-RA failed: %s", exc)
+            return None, None
 
         if traj is None:
             logger.warning("TOPP-RA returned None trajectory")
@@ -158,9 +157,9 @@ class JointToppraPlanner:
             eef_smooth = np.array([fk_pos(q) for q in q_smooth])   # (M, 3)
         except Exception as exc:
             logger.warning("FK failed during TOPP-RA back-conversion: %s", exc)
-            return None
+            return None, None
 
-        return eef_smooth   # (M, 3)
+        return eef_smooth, q_smooth   # (M, 3), (M, N)
 
     def add_to_plot(self, axes, toppra_predictions, colors=("orange", "limegreen", "deepskyblue")):
         """Overlay smoothed EEF trajectories onto existing x/y/z axes."""

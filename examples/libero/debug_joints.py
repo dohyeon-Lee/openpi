@@ -16,6 +16,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+from typing import Literal
 
 import numpy as np
 import tyro
@@ -51,6 +52,12 @@ class Args:
     num_trials: int = 1             # how many rollouts to run (was 50 per task)
     max_steps: int = 100            # cap per episode
 
+    # ── 실행 모드 ──────────────────────────────────────────────────────────────
+    # osc_chunk   : 원래 방식 — policy chunk를 OSC로 그대로 실행 (TOPP-RA는 시각화만)
+    # osc_toppra  : TOPP-RA 결과를 delta EEF로 변환해 OSC로 실행
+    # joint_toppra: TOPP-RA 결과 joint position을 직접 실행 (JOINT_POSITION 컨트롤러 필요)
+    execution_mode: Literal["osc_chunk", "osc_toppra", "joint_toppra"] = "osc_chunk"
+
     log_every: int = 1              # print joint info every N steps (1 = every step)
     save_csv: bool = False          # also save a CSV of joint data
 
@@ -60,6 +67,49 @@ class Args:
 
     save_video: bool = True        # save rollout video (mp4)
     video_fps: int = 10
+
+OSC_POS_SCALE = 0.05  # osc_pose.json output_max xyz
+OSC_ORI_SCALE = 0.5   # osc_pose.json output_max rot
+
+
+def _build_osc_actions_from_toppra(q_smooth, action_chunk, kin, n_steps):
+    """TOPP-RA joint trajectory → OSC delta EEF actions.
+
+    q_smooth    : (M, N) TOPP-RA smoothed joint positions
+    action_chunk: (T, 7) policy 출력 (gripper 값 참조용)
+    kin         : MujocoKinematics
+    n_steps     : 몇 스텝치 action을 만들지
+
+    Returns
+    -------
+    list of (7,) OSC actions  [delta_pos/0.05, delta_ori/0.5, gripper]
+    """
+    from robot_kinematics import log_SO3
+    actions = []
+    for i in range(min(n_steps, len(q_smooth) - 1)):
+        delta_pos = (kin.fk_pos(q_smooth[i + 1]) - kin.fk_pos(q_smooth[i])) / OSC_POS_SCALE
+        R_curr    = kin.fk_rot(q_smooth[i])
+        R_next    = kin.fk_rot(q_smooth[i + 1])
+        delta_ori = log_SO3(R_next @ R_curr.T) / OSC_ORI_SCALE
+        gripper   = action_chunk[min(i, len(action_chunk) - 1), 6]
+        actions.append(np.concatenate([delta_pos, delta_ori, [gripper]]))
+    return actions
+
+
+def _build_joint_actions_from_toppra(q_smooth, action_chunk, n_steps):
+    """TOPP-RA joint trajectory → JOINT_POSITION actions.
+
+    Returns
+    -------
+    list of (8,) actions  [q (7,), gripper (1,)]
+    (JOINT_POSITION 컨트롤러 사용 시: env controller_config 변경 필요)
+    """
+    actions = []
+    for i in range(1, min(n_steps + 1, len(q_smooth))):
+        gripper = action_chunk[min(i - 1, len(action_chunk) - 1), 6]
+        actions.append(np.append(q_smooth[i], gripper))
+    return actions
+
 
 def predict_eef_trajectory(robot, obs, action_chunk):
     """action_chunk (N, 7) OSC actions → predicted EEF positions (N, 3)"""
@@ -398,39 +448,54 @@ def main(args: Args):
                 chunk_frame = render_chunk_overlay(robot_img, predicted_eef, obs["robot0_eef_pos"], env.env.sim, "agentview", step)
                 chunk_frames.append(chunk_frame)
 
-                action_plan.extend(action_chunk[:args.replan_steps])
-
-                # Diff IK 검증: chunk EEF → joint → FK 복원
+                # ── Diff IK: chunk EEF → joint waypoints ──────────────────────
                 kin = MujocoKinematics(env.env.robots[0])
                 q0, x_traj, R_traj, dt = extract_diff_ik_inputs(obs, action_chunk, env.env.robots[0], ctrl_freq)
-                if step == 0:
-                    print_diff_ik_inputs(q0, x_traj, R_traj, dt)
                 q_waypoints = diff_ik_trajectory(q0, x_traj, R_traj, dt, kin)
                 fk_check = np.array([kin.fk_pos(q) for q in q_waypoints])
-                ik_err = np.abs(fk_check - x_traj)
-                print(f"  [IK err] max={ik_err.max(axis=0).round(4)}  mean={ik_err.mean(axis=0).round(4)}")
                 ik_records.append((step, x_traj, fk_check))
 
-                # joint velocity clamp: TOPP-RA 입력 전 한계 초과 waypoint 보정
-                qdot = np.diff(q_waypoints, axis=0) * ctrl_freq        # (T-1, 7) rad/s
-                scale = np.max(np.abs(qdot) / toppra_planner.vel_limits, axis=1, keepdims=True)  # (T-1, 1)
-                scale = np.maximum(scale, 1.0)                          # 한계 이내는 그대로
+                # ── joint velocity clamp ───────────────────────────────────────
+                qdot = np.diff(q_waypoints, axis=0) * ctrl_freq
+                scale = np.maximum(np.max(np.abs(qdot) / toppra_planner.vel_limits, axis=1, keepdims=True), 1.0)
                 q_waypoints_clamped = q_waypoints.copy()
                 for i in range(1, len(q_waypoints)):
                     q_waypoints_clamped[i] = q_waypoints_clamped[i - 1] + (
                         q_waypoints[i] - q_waypoints[i - 1]
                     ) / scale[i - 1, 0]
 
-                # TOPP-RA: joint waypoints → velocity/accel-constrained smooth EEF trajectory
+                # ── TOPP-RA: 항상 계산 (시각화 + 선택적 실행) ─────────────────
                 if step == 0:
-                    print(f"  [TOPP-RA] q_waypoints shape: {q_waypoints.shape}")
-                    qdot = np.diff(q_waypoints, axis=0) * ctrl_freq  # rad/s
-                    print(f"  [TOPP-RA] max joint vel: {np.abs(qdot).max(axis=0).round(3)}")
-                    print(f"  [TOPP-RA] panda vel lim: {toppra_planner.vel_limits.round(3)}")
-                eef_smooth = toppra_planner.plan(q_waypoints_clamped, fk_pos=kin.fk_pos, inv_dyn=kin.inv_dyn)
-                if step == 0 and eef_smooth is not None:
-                    print(f"  [TOPP-RA] eef_smooth shape: {eef_smooth.shape}  (원본 T={q_waypoints.shape[0]})")
+                    print("[TOPP-RA] torque constraint: ON (inv_dyn=kin.inv_dyn)")
+                eef_smooth, q_smooth = toppra_planner.plan(
+                    q_waypoints_clamped, fk_pos=kin.fk_pos, inv_dyn=kin.inv_dyn
+                )
                 toppra_predictions.append((step, eef_smooth))
+
+                # ── execution_mode에 따라 action_plan 채우기 ───────────────────
+                if args.execution_mode == "osc_chunk":
+                    # 원래 방식: policy chunk 그대로 실행
+                    action_plan.extend(action_chunk[:args.replan_steps])
+
+                elif args.execution_mode == "osc_toppra":
+                    # TOPP-RA → delta EEF → OSC 실행
+                    if q_smooth is not None:
+                        toppra_osc = _build_osc_actions_from_toppra(
+                            q_smooth, action_chunk, kin, args.replan_steps
+                        )
+                        action_plan.extend(toppra_osc if toppra_osc else action_chunk[:args.replan_steps])
+                    else:
+                        action_plan.extend(action_chunk[:args.replan_steps])  # fallback
+
+                elif args.execution_mode == "joint_toppra":
+                    # TOPP-RA → joint position 직접 실행 (JOINT_POSITION 컨트롤러 필요)
+                    if q_smooth is not None:
+                        joint_actions = _build_joint_actions_from_toppra(
+                            q_smooth, action_chunk, args.replan_steps
+                        )
+                        action_plan.extend(joint_actions if joint_actions else action_chunk[:args.replan_steps])
+                    else:
+                        action_plan.extend(action_chunk[:args.replan_steps])  # fallback
 
             action = action_plan.popleft()
             obs, _, done, _ = env.step(action.tolist())
