@@ -41,10 +41,10 @@ LIBERO_ENV_RESOLUTION = 256
 
 @dataclasses.dataclass
 class Args:
-    host: str = "172.20.1.100"
+    host: str = "10.1.1.27"
     port: int = 8000
     resize_size: int = 224
-    replan_steps: int = 5
+    replan_steps: int = 5 # 5
 
     task_suite_name: str = "libero_spatial"  # libero_spatial | libero_object | libero_goal | libero_10 | libero_90
     task_keyword: str = ""          # filter tasks whose description contains this string (case-insensitive). empty = first task
@@ -53,10 +53,23 @@ class Args:
     max_steps: int = 150            # cap per episode
 
     # ── 실행 모드 ──────────────────────────────────────────────────────────────
-    # osc_chunk   : 원래 방식 — policy chunk를 OSC로 그대로 실행 (TOPP-RA는 시각화만)
-    # osc_toppra  : TOPP-RA 결과를 delta EEF로 변환해 OSC로 실행
-    # joint_toppra: TOPP-RA 결과 joint position을 직접 실행 (JOINT_POSITION 컨트롤러 필요)
-    execution_mode: Literal["osc_chunk", "osc_toppra", "joint_toppra"] = "osc_chunk"
+    # osc_chunk    : 원래 방식 — policy chunk를 OSC로 그대로 실행 (TOPP-RA는 시각화만)
+    # osc_toppra   : TOPP-RA 결과를 delta EEF로 변환해 OSC로 실행
+    # joint_toppra : TOPP-RA 결과 joint position을 직접 실행 (JOINT_POSITION 컨트롤러 필요)
+    # toppra_global: TOPP-RA + QuadraticAlphaSurrogate로 끝 속도 스케일업
+    execution_mode: Literal["osc_chunk", "osc_toppra", "joint_toppra", "toppra_global"] = "osc_chunk"
+
+    # ── toppra_global img_limits (baseline rollout에서 관찰된 최대 절댓값) ──────
+    # 각 관절의 최대 관측 속도/토크 — baseline rollout 후 실측값으로 교체
+    # img_vel_limits: tuple = (0.071408, 0.487535, 0.104895, 0.479261, 0.154833, 0.305744, 0.303806)  # measured baseline
+    # img_torque_limits: tuple = (4.685017, 61.12016, 4.828411, 23.30906, 2.879619, 4.859772, 2.376167)  # measured baseline
+    # 2/3 of Panda hardware limits (PANDA_VEL_LIMITS * 2/3, PANDA_TORQUE_LIMITS * 2/3)
+    img_vel_limits: tuple = (1.45, 1.45, 1.45, 1.45, 1.74, 1.74, 1.74)        # rad/s per joint
+    img_torque_limits: tuple = (58.0, 58.0, 58.0, 58.0, 8.0, 8.0, 8.0)        # Nm per joint
+    alpha_star_max: float = 2        # toppra_global: alpha* 상한값
+    # Franka Panda joint limits
+    # PANDA_VEL_LIMITS    = np.array([2.175, 2.175, 2.175, 2.175, 2.61,  2.61,  2.61 ])  # rad/s
+    # PANDA_TORQUE_LIMITS = np.array([87.0,  87.0,  87.0,  87.0,  12.0,  12.0,  12.0 ])  # N·m
 
     log_every: int = 1              # print joint info every N steps (1 = every step)
     save_csv: bool = False          # also save a CSV of joint data
@@ -70,6 +83,10 @@ class Args:
 
 OSC_POS_SCALE = 0.05  # osc_pose.json output_max xyz
 OSC_ORI_SCALE = 0.5   # osc_pose.json output_max rot
+
+# toppra_global img_limits bias (img_limits에 더해지는 여유값)
+IMG_VEL_BIAS   = 0.5   # rad/s
+IMG_TORQUE_BIAS = 5.0  # Nm
 
 
 def _build_osc_actions_from_toppra(q_smooth, action_chunk, kin, n_steps):
@@ -88,10 +105,10 @@ def _build_osc_actions_from_toppra(q_smooth, action_chunk, kin, n_steps):
     actions = []
     for i in range(min(n_steps, len(q_smooth) - 1)):
         delta_pos = (kin.fk_pos(q_smooth[i + 1]) - kin.fk_pos(q_smooth[i])) / OSC_POS_SCALE
-        R_curr    = kin.fk_rot(q_smooth[i])
-        R_next    = kin.fk_rot(q_smooth[i + 1])
-        delta_ori = log_SO3(R_next @ R_curr.T) / OSC_ORI_SCALE
-        gripper   = action_chunk[min(i, len(action_chunk) - 1), 6]
+        # orientation은 원래 policy action 그대로 사용 (IK가 orientation을 잘 안 따라가므로)
+        orig_i    = min(i, len(action_chunk) - 1)
+        delta_ori = action_chunk[orig_i, 3:6]
+        gripper   = action_chunk[orig_i, 6]
         actions.append(np.concatenate([delta_pos, delta_ori, [gripper]]))
     return actions
 
@@ -305,6 +322,8 @@ def _get_joint_data(env: OffScreenRenderEnv):
 
 def main(args: Args):
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("toppra").setLevel(logging.WARNING)
+    logging.getLogger("robot_kinematics").setLevel(logging.WARNING)
 
     # --- find matching task ---
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -371,6 +390,16 @@ def main(args: Args):
     for trial in range(args.num_trials):
         print(f"\n--- Trial {trial+1}/{args.num_trials} ---")
         env.reset()
+
+        # ── 그리퍼 kp 게인: execution_mode별로 다르게 설정 ──────────────────────
+        gripper_kp = 1000 if args.execution_mode == "osc_chunk" else 1500
+        sim = env.env.sim
+        for _act_id in range(sim.model.nu):
+            _act_name = sim.model.actuator_id2name(_act_id)
+            if "gripper" in _act_name.lower():
+                sim.model.actuator_gainprm[_act_id, 0] = gripper_kp
+        print(f"[gripper kp] mode={args.execution_mode} → kp={gripper_kp}")
+
         obs = env.set_init_state(initial_states[trial % len(initial_states)])
 
         action_plan = collections.deque()
@@ -380,6 +409,8 @@ def main(args: Args):
         chunk_predictions = []  # (start_step, start_pos, predicted_eef) per replan
         ik_records = []         # (start_step, x_traj, fk_check) per replan
         toppra_predictions = [] # (start_step, eef_smooth) per replan
+        all_vels    = []        # (step, 7) joint velocities
+        all_torques = []        # (step, 7) joint torques
         t = 0
 
         while t < args.max_steps + args.num_steps_wait:
@@ -396,6 +427,8 @@ def main(args: Args):
 
             # get & log joint data
             pos, vel, torque = _get_joint_data(env)
+            all_vels.append(vel.copy())
+            all_torques.append(torque.copy())
 
             if step % args.log_every == 0:
                 if args.use_wandb:
@@ -497,6 +530,91 @@ def main(args: Args):
                     else:
                         action_plan.extend(action_chunk[:args.replan_steps])  # fallback
 
+                elif args.execution_mode == "toppra_global":
+                    # TOPP-RA + QuadraticAlphaSurrogate로 끝 속도 스케일업
+                    from speedup_finalspeed import QuadraticAlphaSurrogate, dls_qdot
+                    q0_cur = np.array(env.env.robots[0]._joint_positions)
+                    Jv = kin.jacobian(q0_cur)[:3]   # (3, N)
+                    M  = kin.mass_matrix(q0_cur)    # (N, N)
+                    p  = obs["robot0_eef_pos"].copy()
+
+                    # chunk 첫 EEF delta → v0 (task-space velocity)
+                    v0 = action_chunk[0, :3] * OSC_POS_SCALE * ctrl_freq  # (3,)
+                    if np.linalg.norm(v0) < 1e-6:
+                        v0 = np.array([1e-4, 0.0, 0.0])
+                    qdot0 = dls_qdot(Jv, v0)
+
+                    # h_samples, Jvdotqdot_samples at alpha=0,1,2
+                    h_samples, jdot_samples = {}, {}
+                    for alpha in [0.0, 1.0, 2.0]:
+                        h_samples[alpha] = kin.bias_forces(q0_cur, alpha * qdot0)
+                        jdot_samples[alpha] = kin.jac_dot_qdot(q0_cur, alpha * qdot0)
+
+                    img_vel = np.asarray(args.img_vel_limits, dtype=float) + IMG_VEL_BIAS
+                    img_tau = np.asarray(args.img_torque_limits, dtype=float) + IMG_TORQUE_BIAS
+                    img_limits = {
+                        "dq_min": -img_vel, "dq_max": img_vel,
+                        "tau_min": -img_tau, "tau_max": img_tau,
+                    }
+                    tar_limits = {
+                        "dq_min": -toppra_planner.vel_limits, "dq_max": toppra_planner.vel_limits,
+                        "tau_min": -toppra_planner.torque_limits, "tau_max": toppra_planner.torque_limits,
+                    }
+
+                    surrogate = QuadraticAlphaSurrogate(
+                        Jv=Jv, M=M, p=p, v0=v0, qdot0=qdot0,
+                        h_samples=h_samples, Jvdotqdot_samples=jdot_samples,
+                        img_limits=img_limits, tar_limits=tar_limits,
+                        dt= 1*(1.0 / ctrl_freq),
+                    )
+                    result = surrogate.compute_alpha_star()
+                    alpha_star = min(result["alpha_star"], args.alpha_star_max)
+                    if step % args.log_every == 0:
+                        print(f"[toppra_global] step={step}  alpha*={alpha_star:.3f} (raw={result['alpha_star']:.3f})  feasible={result['feasible']}")
+
+                    # chunk 끝 joint velocity 스케일업
+                    qdot_end_base = (q_waypoints_clamped[-1] - q_waypoints_clamped[-2]) * ctrl_freq
+                    qdot_end_scaled = alpha_star * qdot_end_base
+
+                    # wandb: alpha* 및 관절별 끝 속도 비교 로그
+                    if args.use_wandb:
+                        log_dict = {
+                            "toppra_global/alpha_star": alpha_star,
+                            "toppra_global/feasible": float(result["feasible"]),
+                            "toppra_global/alpha_vel_bound": result.get("alpha_vel_bound", float("nan")),
+                            "toppra_global/qdot_end_base_norm": float(np.linalg.norm(qdot_end_base)),
+                            "toppra_global/qdot_end_scaled_norm": float(np.linalg.norm(qdot_end_scaled)),
+                        }
+                        for j in range(len(qdot_end_base)):
+                            log_dict[f"toppra_global/qdot_end_base_j{j}"]   = float(qdot_end_base[j])
+                            log_dict[f"toppra_global/qdot_end_scaled_j{j}"] = float(qdot_end_scaled[j])
+                        wandb.log(log_dict, step=step)
+
+                    result_tg = toppra_planner.plan(
+                        q_waypoints_clamped, fk_pos=kin.fk_pos, inv_dyn=kin.inv_dyn,
+                        qdot_end_override=qdot_end_scaled,
+                    )
+                    if result_tg is None or result_tg[0] is None:
+                        print(f"[toppra_global] step={step}  TOPP-RA FAILED → fallback to plain toppra")
+                        if args.use_wandb:
+                            wandb.log({"toppra_global/toppra_failed": 1}, step=step)
+                        # fallback: alpha 없는 첫 번째 TOPP-RA 결과 사용
+                        if q_smooth is not None:
+                            toppra_osc = _build_osc_actions_from_toppra(
+                                q_smooth, action_chunk, kin, args.replan_steps
+                            )
+                            action_plan.extend(toppra_osc if toppra_osc else action_chunk[:args.replan_steps])
+                        else:
+                            action_plan.extend(action_chunk[:args.replan_steps])
+                    else:
+                        eef_smooth_tg, q_smooth_tg = result_tg
+                        if args.use_wandb:
+                            wandb.log({"toppra_global/toppra_failed": 0}, step=step)
+                        toppra_osc = _build_osc_actions_from_toppra(
+                            q_smooth_tg, action_chunk, kin, args.replan_steps
+                        )
+                        action_plan.extend(toppra_osc if toppra_osc else action_chunk[:args.replan_steps])
+
             action = action_plan.popleft()
             obs, _, done, _ = env.step(action.tolist())
             t += 1
@@ -527,6 +645,26 @@ def main(args: Args):
             print(f"  Saved chunk video: {chunk_video_path.resolve()}")
             if args.use_wandb:
                 wandb.log({f"video/chunk_trial{trial}": wandb.Video(str(chunk_video_path), fps=2, format="mp4")})
+
+        if args.use_wandb and all_vels:
+            vels    = np.array(all_vels)    # (T, 7)
+            torques = np.array(all_torques) # (T, 7)
+            cols = ["joint", "vel_mean", "vel_max", "vel_min", "vel_absmax",
+                    "trq_mean", "trq_max", "trq_min", "trq_absmax"]
+            table = wandb.Table(columns=cols)
+            for i in range(vels.shape[1]):
+                table.add_data(
+                    f"j{i}",
+                    float(np.mean(vels[:, i])),
+                    float(np.max(vels[:, i])),
+                    float(np.min(vels[:, i])),
+                    float(np.max(np.abs(vels[:, i]))),
+                    float(np.mean(torques[:, i])),
+                    float(np.max(torques[:, i])),
+                    float(np.min(torques[:, i])),
+                    float(np.max(np.abs(torques[:, i]))),
+                )
+            wandb.log({f"joint_stats/trial{trial}": table})
 
         if actual_eef:
             save_3d_trajectory_plot(actual_eef, chunk_predictions, trial, args.use_wandb)

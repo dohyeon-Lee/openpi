@@ -1,6 +1,7 @@
 # Data directories.
 assets/
 checkpoints/
+10000/
 data/
 wandb/
 examples/libero/videos/

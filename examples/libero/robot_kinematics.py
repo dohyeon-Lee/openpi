@@ -140,6 +140,48 @@ class MujocoKinematics:
             self.sim.data.qpos[:] = saved
             self.sim.forward()
 
+    def mass_matrix(self, q: np.ndarray) -> np.ndarray:
+        """(N,) → (N, N) joint-space mass matrix M(q)"""
+        import mujoco
+        model_ptr = self.sim.model._model
+        if model_ptr is not self._inv_dyn_model_ptr:
+            self._inv_dyn_data = mujoco.MjData(model_ptr)
+            self._inv_dyn_model_ptr = model_ptr
+
+        idx = self.joint_qpos_indices
+        d = self._inv_dyn_data
+        d.qpos[idx] = q
+        d.qvel[idx] = 0.0
+        mujoco.mj_kinematics(model_ptr, d)
+        mujoco.mj_comPos(model_ptr, d)
+        nv = model_ptr.nv
+        M_full = np.zeros((nv, nv))
+        mujoco.mj_fullM(model_ptr, M_full, d.qM)
+        return M_full[np.ix_(idx, idx)]
+
+    def bias_forces(self, q: np.ndarray, qd: np.ndarray) -> np.ndarray:
+        """(N,) → (N,) bias forces h(q, qd) = C(q,qd)qd + g(q)"""
+        import mujoco
+        model_ptr = self.sim.model._model
+        if model_ptr is not self._inv_dyn_model_ptr:
+            self._inv_dyn_data = mujoco.MjData(model_ptr)
+            self._inv_dyn_model_ptr = model_ptr
+
+        idx = self.joint_qpos_indices
+        d = self._inv_dyn_data
+        d.qpos[idx] = q
+        d.qvel[idx] = qd
+        d.qacc[idx] = 0.0
+        mujoco.mj_fwdPosition(model_ptr, d)
+        mujoco.mj_fwdVelocity(model_ptr, d)
+        return np.array(d.qfrc_bias[idx])
+
+    def jac_dot_qdot(self, q: np.ndarray, qd: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+        """Translational Jdot * qd via finite difference: (3,)"""
+        J0 = self.jacobian(q)[:3]                     # (3, N)
+        J1 = self.jacobian(q + eps * qd)[:3]          # (3, N)
+        return ((J1 - J0) / eps) @ qd                 # (3,)
+
     def inv_dyn(self, q: np.ndarray, qd: np.ndarray, qdd: np.ndarray) -> np.ndarray:
         """Inverse dynamics: (q, qd, qdd) → joint torques (N,)
         τ = M(q)q̈ + C(q,q̇)q̇ + g(q)
