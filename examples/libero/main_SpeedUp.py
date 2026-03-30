@@ -39,47 +39,109 @@ LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 
 
+# ── Per-robot joint limits ─────────────────────────────────────────────────────
+@dataclasses.dataclass
+class RobotConfig:
+    dof: int
+    vel_limits:    np.ndarray   # rad/s
+    acc_limits:    np.ndarray   # rad/s²
+    torque_limits: np.ndarray   # N·m
+    friction_coef: np.ndarray   # viscous friction (N·m·s/rad)
+
+ROBOT_CONFIGS: dict = {
+    "Panda": RobotConfig(
+        dof=7,
+        vel_limits    = np.array([2.175, 2.175, 2.175, 2.175, 2.61,  2.61,  2.61 ]),
+        acc_limits    = np.array([15.0,  7.5,   10.0,  12.5,  15.0,  20.0,  20.0 ]),
+        torque_limits = np.array([87.0,  87.0,  87.0,  87.0,  12.0,  12.0,  12.0 ]),
+        friction_coef = np.array([0.2,   0.2,   0.15,  0.15,  0.1,   0.1,   0.1  ]),
+    ),
+    "UR5e": RobotConfig(
+        dof=6,
+        vel_limits    = np.array([2.094, 2.094, 2.094, 3.14,  3.14,  3.14  ]),
+        acc_limits    = np.array([1.57,  1.57,  1.57,  1.57,  1.57,  1.57  ]),
+        torque_limits = np.array([150.0, 150.0, 150.0, 28.0,  28.0,  28.0  ]),
+        friction_coef = np.array([0.2,   0.2,   0.15,  0.1,   0.1,   0.1   ]),
+    ),
+    "IIWA": RobotConfig(
+        dof=7,
+        vel_limits    = np.array([1.484, 1.484, 1.745, 1.745, 2.269, 2.269, 2.269]),
+        acc_limits    = np.array([20.0,  20.0,  20.0,  20.0,  20.0,  20.0,  20.0  ]),
+        torque_limits = np.array([176.0, 176.0, 110.0, 110.0, 110.0, 40.0,  40.0 ]),
+        friction_coef = np.array([0.2,   0.2,   0.15,  0.15,  0.1,   0.1,   0.1  ]),
+    ),
+    "Sawyer": RobotConfig(
+        dof=7,
+        vel_limits    = np.array([1.74,  1.74,  1.74,  1.74,  3.49,  3.49,  3.49 ]),
+        acc_limits    = np.array([5.0,   5.0,   5.0,   5.0,   8.0,   8.0,   8.0  ]),
+        torque_limits = np.array([80.0,  80.0,  80.0,  80.0,  20.0,  20.0,  20.0 ]),
+        friction_coef = np.array([0.2,   0.2,   0.15,  0.15,  0.1,   0.1,   0.1  ]),
+    ),
+    "Kinova3": RobotConfig(
+        dof=7,
+        vel_limits    = np.array([1.396, 1.396, 1.396, 1.396, 1.222, 1.222, 1.222]),
+        acc_limits    = np.array([5.0,   5.0,   5.0,   5.0,   5.0,   5.0,   5.0  ]),
+        torque_limits = np.array([39.0,  39.0,  39.0,  39.0,  9.0,   9.0,   9.0  ]),
+        friction_coef = np.array([0.2,   0.2,   0.15,  0.15,  0.1,   0.1,   0.1  ]),
+    ),
+}
+
+
 @dataclasses.dataclass
 class Args:
-    host: str = "10.1.1.27"
+    host: str = "10.1.1.25"
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5 # 5
 
+    # ── choose robot ───────────────────────────────────────────────────────────────
+    # Panda | IIWA 
+    robot_name: str = "Panda"
+
     task_suite_name: str = "libero_spatial"  # libero_spatial | libero_object | libero_goal | libero_10 | libero_90
     task_keyword: str = ""          # filter tasks whose description contains this string (case-insensitive). empty = first task
+    task_index: int = 0            # task index (-1 = use task_keyword or first task)
     num_steps_wait: int = 10
     num_trials: int = 1             # how many rollouts to run (was 50 per task)
-    max_steps: int = 150            # cap per episode
+    max_steps: int = 100            # cap per episode
 
     # ── 실행 모드 ──────────────────────────────────────────────────────────────
     # osc_chunk    : 원래 방식 — policy chunk를 OSC로 그대로 실행 (TOPP-RA는 시각화만)
     # osc_toppra   : TOPP-RA 결과를 delta EEF로 변환해 OSC로 실행
-    # joint_toppra : TOPP-RA 결과 joint position을 직접 실행 (JOINT_POSITION 컨트롤러 필요)
     # toppra_global: TOPP-RA + QuadraticAlphaSurrogate로 끝 속도 스케일업
-    execution_mode: Literal["osc_chunk", "osc_toppra", "joint_toppra", "toppra_global"] = "osc_chunk"
+    execution_mode: Literal["osc_chunk", "osc_toppra", "toppra_global"] = "osc_chunk"
 
     # ── toppra_global img_limits (baseline rollout에서 관찰된 최대 절댓값) ──────
-    # 각 관절의 최대 관측 속도/토크 — baseline rollout 후 실측값으로 교체
+    
+    # Measured physical limits (from rollout)
     # img_vel_limits: tuple = (0.071408, 0.487535, 0.104895, 0.479261, 0.154833, 0.305744, 0.303806)  # measured baseline
     # img_torque_limits: tuple = (4.685017, 61.12016, 4.828411, 23.30906, 2.879619, 4.859772, 2.376167)  # measured baseline
+    
     # 2/3 of Panda hardware limits (PANDA_VEL_LIMITS * 2/3, PANDA_TORQUE_LIMITS * 2/3)
     img_vel_limits: tuple = (1.45, 1.45, 1.45, 1.45, 1.74, 1.74, 1.74)        # rad/s per joint
     img_torque_limits: tuple = (58.0, 58.0, 58.0, 58.0, 8.0, 8.0, 8.0)        # Nm per joint
+    
+    # original pandas spec
+    # img_vel_limits: tuple = (2.175, 2.175, 2.175, 2.175, 2.61,  2.61,  2.61)        # rad/s per joint
+    # img_torque_limits: tuple = (87.0,  87.0,  87.0,  87.0,  12.0,  12.0,  12.0 )        # Nm per joint
+    
     alpha_star_max: float = 2        # toppra_global: alpha* 상한값
-    # Franka Panda joint limits
-    # PANDA_VEL_LIMITS    = np.array([2.175, 2.175, 2.175, 2.175, 2.61,  2.61,  2.61 ])  # rad/s
-    # PANDA_TORQUE_LIMITS = np.array([87.0,  87.0,  87.0,  87.0,  12.0,  12.0,  12.0 ])  # N·m
+
+    # ── OSC controller ─────────────────────────────────────────────────────────
+    osc_kp: float = 2000.0           # OSC position+orientation Kp gain (default: 2000 from osc_pose.json)
+    osc_ramp_ratio: float = 1.0      # OSC ramp ratio (default: 0.2 from osc_pose.json, 1.0=no ramp)
 
     log_every: int = 1              # print joint info every N steps (1 = every step)
     save_csv: bool = False          # also save a CSV of joint data
 
     use_wandb: bool = True         # enable wandb logging
-    wandb_project: str = "libero-debug"
+    wandb_project: str = "libero-SpeedUp"
     wandb_run_name: str = ""        # empty = auto-generated
 
     save_video: bool = True        # save rollout video (mp4)
     video_fps: int = 10
+
+
 
 OSC_POS_SCALE = 0.05  # osc_pose.json output_max xyz
 OSC_ORI_SCALE = 0.5   # osc_pose.json output_max rot
@@ -88,44 +150,77 @@ OSC_ORI_SCALE = 0.5   # osc_pose.json output_max rot
 IMG_VEL_BIAS   = 0.5   # rad/s
 IMG_TORQUE_BIAS = 5.0  # Nm
 
+# LIBERO init_states는 Panda 기준으로 저장됨
+_PANDA_NQ       = 48   # Panda 환경 qpos 총 크기
+_PANDA_NV       = 43   # Panda 환경 qvel 총 크기
+_PANDA_N_ROBOT  = 9    # Panda arm(7) + PandaGripper(2)
 
-def _build_osc_actions_from_toppra(q_smooth, action_chunk, kin, n_steps):
-    """TOPP-RA joint trajectory → OSC delta EEF actions.
+
+def _adapt_init_state(panda_state: np.ndarray, env) -> np.ndarray: # for Cross-Embodiment exp
+    """Panda 기준으로 저장된 init_state를 현재 로봇 환경에 맞게 변환.
+
+    로봇 관절은 현재 로봇의 init_qpos(arm) + 0(gripper)로 채우고,
+    오브젝트 state는 저장된 값 그대로 사용.
+    """
+    sim = env.env.sim
+
+    # 저장된 state가 이미 현재 환경과 맞으면 그대로 반환
+    if len(panda_state) == sim.model.nq + sim.model.nv:
+        return panda_state
+
+    # Panda state 파싱 (state[0]=time, state[1:1+nq]=qpos, state[1+nq:]=qvel)
+    _OFFSET = 1  # time field
+    panda_qpos = panda_state[_OFFSET : _OFFSET + _PANDA_NQ]
+    panda_qvel = panda_state[_OFFSET + _PANDA_NQ : _OFFSET + _PANDA_NQ + _PANDA_NV]
+    obj_qpos   = panda_qpos[_PANDA_N_ROBOT:]
+    obj_qvel   = panda_qvel[_PANDA_N_ROBOT:]
+
+    # 현재 로봇의 robot joint 수 계산 (arm + gripper, 모두 1-DOF)
+    joint_names = list(sim.model.joint_names)
+    n_robot = sum(1 for j in joint_names if j.startswith("robot0_") or j.startswith("gripper0_"))
+
+    nq = sim.model.nq
+    nv = sim.model.nv
+
+    # 새 state 구성
+    new_qpos = np.zeros(nq)
+    new_qpos[n_robot:] = obj_qpos
+
+    # arm init_qpos 채우기 (gripper는 0 유지)
+    arm_qpos = env.env.robots[0].robot_model.init_qpos
+    n_arm = len(arm_qpos)
+    new_qpos[:n_arm] = arm_qpos
+
+    new_qvel = np.zeros(nv)
+    new_qvel[n_robot:] = obj_qvel
+
+    result = np.concatenate([[panda_state[0]], new_qpos, new_qvel])  # time + qpos + qvel
+    return result
+
+
+def _build_osc_targets_from_toppra(q_smooth, action_chunk, kin, n_steps):
+    """TOPP-RA joint trajectory → absolute EEF target tuples.
+
+    실행 시점에 delta = target_pos - actual_pos 로 계산하여
+    tracking error가 매 스텝 보정되도록 한다.
 
     q_smooth    : (M, N) TOPP-RA smoothed joint positions
     action_chunk: (T, 7) policy 출력 (gripper 값 참조용)
     kin         : MujocoKinematics
-    n_steps     : 몇 스텝치 action을 만들지
+    n_steps     : 몇 스텝치 target을 만들지
 
     Returns
     -------
-    list of (7,) OSC actions  [delta_pos/0.05, delta_ori/0.5, gripper]
+    list of (target_pos (3,), delta_ori (3,), gripper float)
     """
-    from robot_kinematics import log_SO3
-    actions = []
+    targets = []
     for i in range(min(n_steps, len(q_smooth) - 1)):
-        delta_pos = (kin.fk_pos(q_smooth[i + 1]) - kin.fk_pos(q_smooth[i])) / OSC_POS_SCALE
-        # orientation은 원래 policy action 그대로 사용 (IK가 orientation을 잘 안 따라가므로)
-        orig_i    = min(i, len(action_chunk) - 1)
-        delta_ori = action_chunk[orig_i, 3:6]
-        gripper   = action_chunk[orig_i, 6]
-        actions.append(np.concatenate([delta_pos, delta_ori, [gripper]]))
-    return actions
-
-
-def _build_joint_actions_from_toppra(q_smooth, action_chunk, n_steps):
-    """TOPP-RA joint trajectory → JOINT_POSITION actions.
-
-    Returns
-    -------
-    list of (8,) actions  [q (7,), gripper (1,)]
-    (JOINT_POSITION 컨트롤러 사용 시: env controller_config 변경 필요)
-    """
-    actions = []
-    for i in range(1, min(n_steps + 1, len(q_smooth))):
-        gripper = action_chunk[min(i - 1, len(action_chunk) - 1), 6]
-        actions.append(np.append(q_smooth[i], gripper))
-    return actions
+        target_pos = kin.fk_pos(q_smooth[i + 1])
+        orig_i     = min(i, len(action_chunk) - 1)
+        delta_ori  = action_chunk[orig_i, 3:6]
+        gripper    = float(action_chunk[orig_i, 6])
+        targets.append((target_pos, delta_ori, gripper))
+    return targets
 
 
 def predict_eef_trajectory(robot, obs, action_chunk):
@@ -194,11 +289,12 @@ def render_chunk_overlay(robot_img, predicted_eef, current_eef, sim, cam_name, s
 
 
 def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb,
-                              toppra_predictions=None):
+                              toppra_predictions=None, toppra_global_predictions=None):
     """x/y/z별로 시간축 그래프: 실제 EEF + chunk 예측 + TOPP-RA 오버레이.
 
-    toppra_predictions : list of (start_step, eef_smooth)
-                         eef_smooth = (M, 3) or None (toppra 미설치 시)
+    toppra_predictions        : list of (start_step, eef_smooth)
+    toppra_global_predictions : list of (start_step, eef_smooth_tg)
+                                eef_smooth = (M, 3) or None (toppra 미설치 시)
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -207,14 +303,15 @@ def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb,
     actual = np.array(actual_eef)
     n_steps = len(actual)
     labels = ["x", "y", "z"]
-    actual_colors = ["r", "g", "b"]
-    chunk_colors  = ["orange", "limegreen", "deepskyblue"]
-    toppra_colors = ["darkorange", "darkgreen", "dodgerblue"]
+    actual_colors  = ["r", "g", "b"]
+    chunk_colors   = ["orange", "limegreen", "deepskyblue"]
+    toppra_colors  = ["darkorange", "darkgreen", "dodgerblue"]
+    tg_colors      = ["red", "forestgreen", "royalblue"]
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
 
-    for dim, (ax, label, ac, cc, tc) in enumerate(
-        zip(axes, labels, actual_colors, chunk_colors, toppra_colors)
+    for dim, (ax, label, ac, cc, tc, tgc) in enumerate(
+        zip(axes, labels, actual_colors, chunk_colors, toppra_colors, tg_colors)
     ):
         # ── 실제 EEF ──────────────────────────────────────────────────────────
         ax.plot(range(n_steps), actual[:, dim], color=ac, linewidth=2, label="actual")
@@ -231,8 +328,8 @@ def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb,
                 if 0 <= idx < len(chunk):
                     ax.scatter(next_step, chunk[idx, dim], color=cc, s=30, marker="x", zorder=5,
                                label="chunk pred at replan" if i == 0 else None)
-                    ax.scatter(next_step, next_pos[dim], color=ac, s=40, zorder=5,
-                               label="actual at replan" if i == 0 else None)
+                ax.scatter(next_step, next_pos[dim], color=ac, s=40, zorder=5,
+                           label="actual at replan" if i == 0 else None)
 
         # ── TOPP-RA smoothed (dotted) ─────────────────────────────────────────
         if toppra_predictions:
@@ -243,13 +340,22 @@ def save_time_trajectory_plot(actual_eef, chunk_predictions, trial, use_wandb,
                 ax.plot(t_range, eef_smooth[:, dim], color=tc, alpha=0.8, linewidth=1.5,
                         linestyle=":", label="toppra" if i == 0 else None)
 
+        # ── TOPP-RA global (dashed) ───────────────────────────────────────────
+        if toppra_global_predictions:
+            for i, (start_step, eef_smooth_tg) in enumerate(toppra_global_predictions):
+                if eef_smooth_tg is None:
+                    continue
+                t_range = list(range(start_step, start_step + len(eef_smooth_tg)))
+                ax.plot(t_range, eef_smooth_tg[:, dim], color=tgc, alpha=0.9, linewidth=1.5,
+                        linestyle="--", label="toppra_global" if i == 0 else None)
+
         ax.set_ylabel(label)
         ax.legend(loc="upper right", fontsize=7)
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel("timestep")
     fig.suptitle(f"EEF Trajectory over Time (trial {trial})\n"
-                 "solid=chunk(IK)  dotted=TOPP-RA smoothed")
+                 "solid=chunk(IK)  dotted=TOPP-RA  dashed=TOPP-RA global")
     fig.tight_layout()
 
     out_path = pathlib.Path("videos") / f"traj_time_trial{trial}.png"
@@ -331,12 +437,16 @@ def main(args: Args):
 
     selected_task = None
     selected_task_id = None
-    for task_id in range(task_suite.n_tasks):
-        task = task_suite.get_task(task_id)
-        if args.task_keyword.lower() in task.language.lower():
-            selected_task = task
-            selected_task_id = task_id
-            break
+    if args.task_index >= 0:
+        selected_task = task_suite.get_task(args.task_index)
+        selected_task_id = args.task_index
+    else:
+        for task_id in range(task_suite.n_tasks):
+            task = task_suite.get_task(task_id)
+            if args.task_keyword.lower() in task.language.lower():
+                selected_task = task
+                selected_task_id = task_id
+                break
 
     if selected_task is None:
         if args.task_keyword:
@@ -350,9 +460,14 @@ def main(args: Args):
     if args.use_wandb:
         wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name or None,
+            name=args.wandb_run_name or f"{args.execution_mode}_{int(args.osc_kp)}",
             config={**dataclasses.asdict(args), "task_description": task_description},
         )
+
+    # --- validate robot ---
+    if args.robot_name not in ROBOT_CONFIGS:
+        raise ValueError(f"Unknown robot '{args.robot_name}'. Available: {list(ROBOT_CONFIGS)}")
+    robot_cfg = ROBOT_CONFIGS[args.robot_name]
 
     # --- build env ---
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / selected_task.problem_folder / selected_task.bddl_file
@@ -360,22 +475,37 @@ def main(args: Args):
         bddl_file_name=str(task_bddl_file),
         camera_heights=LIBERO_ENV_RESOLUTION,
         camera_widths=LIBERO_ENV_RESOLUTION,
+        robots=[args.robot_name],
     )
     env.seed(42)
 
     robot = env.env.robots[0]
     print(f"\n=== Robot Info ===")
+    print(f"  name        : {args.robot_name}")
     print(f"  type        : {type(robot.robot_model).__name__}")
     print(f"  dof         : {robot.dof}")
-    print(f"  torque_limits: {robot.torque_limits}")
+    print(f"  vel_limits  : {robot_cfg.vel_limits}")
+    print(f"  torque_limits: {robot_cfg.torque_limits}")
+    print(f"  nq (qpos size): {env.env.sim.model.nq}")
+    print(f"  nv (qvel size): {env.env.sim.model.nv}")
+    print(f"  joint_names   : {list(env.env.sim.model.joint_names)}")
     print(f"==================\n")
 
+
     initial_states = task_suite.get_task_init_states(selected_task_id)
+
+    dummy_action = list(LIBERO_DUMMY_ACTION)
 
     # --- connect to policy server ---
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     ctrl_freq = env.env.control_freq
-    toppra_planner = JointToppraPlanner(controller_freq=ctrl_freq)
+    toppra_planner = JointToppraPlanner(
+        controller_freq=ctrl_freq,
+        vel_limits=robot_cfg.vel_limits,
+        acc_limits=robot_cfg.acc_limits,
+        torque_limits=robot_cfg.torque_limits,
+        friction_coef=robot_cfg.friction_coef,
+    )
 
     joint_names = [f"j{i}" for i in range(7)]
     header = (
@@ -391,24 +521,35 @@ def main(args: Args):
         print(f"\n--- Trial {trial+1}/{args.num_trials} ---")
         env.reset()
 
-        # ── 그리퍼 kp 게인: execution_mode별로 다르게 설정 ──────────────────────
-        gripper_kp = 1000 if args.execution_mode == "osc_chunk" else 1500
+        # Override OSC controller params after reset (hard_reset recreates controller from json)
+        _ctrl = env.env.robots[0].controller
+        _ctrl.kp = np.full(6, args.osc_kp)
+        _ctrl.kd = 2 * np.sqrt(_ctrl.kp)
+        _ctrl.ramp_ratio = args.osc_ramp_ratio
+
+        # ── 액추에이터 목록 출력 (gripper 관련 확인용) ──────────────────────────
         sim = env.env.sim
+        print("[actuators]")
         for _act_id in range(sim.model.nu):
             _act_name = sim.model.actuator_id2name(_act_id)
-            if "gripper" in _act_name.lower():
-                sim.model.actuator_gainprm[_act_id, 0] = gripper_kp
-        print(f"[gripper kp] mode={args.execution_mode} → kp={gripper_kp}")
+            print(f"  {_act_id}: {_act_name}")
 
-        obs = env.set_init_state(initial_states[trial % len(initial_states)])
+        obs = env.set_init_state(_adapt_init_state(initial_states[trial % len(initial_states)], env))
+        # 오브젝트 위치 확인
+        for k, v in obs.items():
+            if "pos" in k and "robot" not in k:
+                print(f"  {k}: {v}")
+        print(f"  robot0_eef_pos: {obs['robot0_eef_pos']}")
 
         action_plan = collections.deque()
         frames = []  # for robot video
+        side_frames = []  # for side-view video
         chunk_frames = []  # for chunk visualization video
         actual_eef = []  # actual EEF positions per step
         chunk_predictions = []  # (start_step, start_pos, predicted_eef) per replan
         ik_records = []         # (start_step, x_traj, fk_check) per replan
         toppra_predictions = [] # (start_step, eef_smooth) per replan
+        toppra_global_predictions = [] # (start_step, eef_smooth_tg) per replan (toppra_global mode only)
         all_vels    = []        # (step, 7) joint velocities
         all_torques = []        # (step, 7) joint torques
         t = 0
@@ -416,7 +557,14 @@ def main(args: Args):
         while t < args.max_steps + args.num_steps_wait:
             # warm-up: let objects settle
             if t < args.num_steps_wait:
-                obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+                obs, _, done, _ = env.step(dummy_action)
+                # warm-up 매 스텝마다 arm을 초기 위치로 고정 (오브젝트만 settling)
+                _sim = env.env.sim
+                _robot = env.env.robots[0]
+                for i, idx in enumerate(_robot._ref_joint_pos_indexes):
+                    _sim.data.qpos[idx] = _robot.robot_model.init_qpos[i]
+                    _sim.data.qvel[idx] = 0.0
+                _sim.forward()
                 t += 1
                 continue
 
@@ -450,6 +598,16 @@ def main(args: Args):
             # collect frame for video (raw resolution before resize)
             if args.save_video:
                 frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
+                _sim = env.env.sim
+                _cid = _sim.model.camera_name2id("agentview")
+                _op, _oq = _sim.model.cam_pos[_cid].copy(), _sim.model.cam_quat[_cid].copy()
+                _sim.model.cam_pos[_cid]  = np.array([-0.1, 1.5, 1.3])
+                _sim.model.cam_quat[_cid] = np.array([0.707, -0.707, 0.0, 0.0])
+                _sim.forward()
+                _sf = _sim.render(camera_name="agentview", height=LIBERO_ENV_RESOLUTION, width=LIBERO_ENV_RESOLUTION)
+                _sim.model.cam_pos[_cid], _sim.model.cam_quat[_cid] = _op, _oq
+                _sim.forward()  # cam_xpos/xmat 복원 (project_points가 이 값을 읽음)
+                side_frames.append(np.ascontiguousarray(_sf))
 
             # query policy
             img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
@@ -462,13 +620,23 @@ def main(args: Args):
             )
 
             if not action_plan:
+                # gripper obs: Panda는 [0.04(open)~0(closed)] x2,
+                # Robotiq85는 finger_joint [0(open)~0.8(closed)] → Panda 스케일로 변환
+                _gqpos = obs["robot0_gripper_qpos"]
+                if len(_gqpos) == 2:
+                    gripper_obs = _gqpos  # Panda
+                else:
+                    _v = float(_gqpos[0])
+                    _norm = (1.0 - _v / 0.8) * 0.04
+                    gripper_obs = np.array([_norm, _norm])
+
                 element = {
                     "observation/image": img,
                     "observation/wrist_image": wrist_img,
                     "observation/state": np.concatenate((
                         obs["robot0_eef_pos"],
                         _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
+                        gripper_obs,
                     )),
                     "prompt": str(task_description),
                 }
@@ -485,6 +653,7 @@ def main(args: Args):
                 kin = MujocoKinematics(env.env.robots[0])
                 q0, x_traj, R_traj, dt = extract_diff_ik_inputs(obs, action_chunk, env.env.robots[0], ctrl_freq)
                 q_waypoints = diff_ik_trajectory(q0, x_traj, R_traj, dt, kin)
+
                 fk_check = np.array([kin.fk_pos(q) for q in q_waypoints])
                 ik_records.append((step, x_traj, fk_check))
 
@@ -501,7 +670,7 @@ def main(args: Args):
                 if step == 0:
                     print("[TOPP-RA] torque constraint: ON (inv_dyn=kin.inv_dyn)")
                 eef_smooth, q_smooth = toppra_planner.plan(
-                    q_waypoints_clamped, fk_pos=kin.fk_pos, inv_dyn=kin.inv_dyn
+                    q_waypoints_clamped, fk_pos=kin.fk_pos, inv_dyn=kin.inv_dyn,
                 )
                 toppra_predictions.append((step, eef_smooth))
 
@@ -513,22 +682,13 @@ def main(args: Args):
                 elif args.execution_mode == "osc_toppra":
                     # TOPP-RA → delta EEF → OSC 실행
                     if q_smooth is not None:
-                        toppra_osc = _build_osc_actions_from_toppra(
+                        toppra_osc = _build_osc_targets_from_toppra(
                             q_smooth, action_chunk, kin, args.replan_steps
                         )
                         action_plan.extend(toppra_osc if toppra_osc else action_chunk[:args.replan_steps])
                     else:
                         action_plan.extend(action_chunk[:args.replan_steps])  # fallback
 
-                elif args.execution_mode == "joint_toppra":
-                    # TOPP-RA → joint position 직접 실행 (JOINT_POSITION 컨트롤러 필요)
-                    if q_smooth is not None:
-                        joint_actions = _build_joint_actions_from_toppra(
-                            q_smooth, action_chunk, args.replan_steps
-                        )
-                        action_plan.extend(joint_actions if joint_actions else action_chunk[:args.replan_steps])
-                    else:
-                        action_plan.extend(action_chunk[:args.replan_steps])  # fallback
 
                 elif args.execution_mode == "toppra_global":
                     # TOPP-RA + QuadraticAlphaSurrogate로 끝 속도 스케일업
@@ -600,7 +760,7 @@ def main(args: Args):
                             wandb.log({"toppra_global/toppra_failed": 1}, step=step)
                         # fallback: alpha 없는 첫 번째 TOPP-RA 결과 사용
                         if q_smooth is not None:
-                            toppra_osc = _build_osc_actions_from_toppra(
+                            toppra_osc = _build_osc_targets_from_toppra(
                                 q_smooth, action_chunk, kin, args.replan_steps
                             )
                             action_plan.extend(toppra_osc if toppra_osc else action_chunk[:args.replan_steps])
@@ -608,14 +768,23 @@ def main(args: Args):
                             action_plan.extend(action_chunk[:args.replan_steps])
                     else:
                         eef_smooth_tg, q_smooth_tg = result_tg
+                        toppra_global_predictions.append((step, eef_smooth_tg))
                         if args.use_wandb:
                             wandb.log({"toppra_global/toppra_failed": 0}, step=step)
-                        toppra_osc = _build_osc_actions_from_toppra(
+                        toppra_osc = _build_osc_targets_from_toppra(
                             q_smooth_tg, action_chunk, kin, args.replan_steps
                         )
                         action_plan.extend(toppra_osc if toppra_osc else action_chunk[:args.replan_steps])
 
-            action = action_plan.popleft()
+            item = action_plan.popleft()
+            if isinstance(item, tuple):
+                # toppra absolute target: compute delta from current actual pos
+                target_pos, delta_ori, gripper = item
+                delta_pos = (target_pos - obs["robot0_eef_pos"]) / OSC_POS_SCALE
+                action = np.concatenate([delta_pos, delta_ori, [gripper]])
+            else:
+                action = item.copy()
+            action[6] = 1.0 if action[6] > 0 else -1.0  # binary gripper
             obs, _, done, _ = env.step(action.tolist())
             t += 1
 
@@ -636,6 +805,15 @@ def main(args: Args):
             print(f"  Saved video: {video_path.resolve()}")
             if args.use_wandb:
                 wandb.log({f"video/trial{trial}": wandb.Video(str(video_path), fps=args.video_fps, format="mp4")})
+
+        if args.save_video and side_frames:
+            import imageio
+            side_video_path = pathlib.Path("videos") / f"sideview_trial{trial}.mp4"
+            side_video_path.parent.mkdir(exist_ok=True)
+            imageio.mimwrite(str(side_video_path), side_frames, fps=args.video_fps)
+            print(f"  Saved side video: {side_video_path.resolve()}")
+            if args.use_wandb:
+                wandb.log({f"video/side_trial{trial}": wandb.Video(str(side_video_path), fps=args.video_fps, format="mp4")})
 
         if chunk_frames:
             import imageio
@@ -669,7 +847,8 @@ def main(args: Args):
         if actual_eef:
             save_3d_trajectory_plot(actual_eef, chunk_predictions, trial, args.use_wandb)
             save_time_trajectory_plot(actual_eef, chunk_predictions, trial, args.use_wandb,
-                                      toppra_predictions=toppra_predictions)
+                                      toppra_predictions=toppra_predictions,
+                                      toppra_global_predictions=toppra_global_predictions)
             if ik_records:
                 save_ik_verification_plot(ik_records, trial, use_wandb=args.use_wandb)
 

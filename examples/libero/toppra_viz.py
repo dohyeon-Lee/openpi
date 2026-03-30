@@ -64,7 +64,7 @@ class JointToppraPlanner:
             logger.warning("toppra not installed – TOPP-RA disabled")
             return False
 
-    def plan(self, q_waypoints: np.ndarray, fk_pos, inv_dyn=None, qdot_end_override: np.ndarray = None):
+    def plan(self, q_waypoints: np.ndarray, fk_pos, inv_dyn=None, qdot_end_override: np.ndarray = None, qdot_start_override: np.ndarray = None):
         """
         Run joint-space TOPP-RA and return smoothed EEF positions.
 
@@ -102,6 +102,8 @@ class JointToppraPlanner:
         # (참고: RACE_code/toppra_interpolator.py 방식)
         qdot_start = (q_waypoints[1]  - q_waypoints[0])  / dt  # (N,) rad/s
         qdot_end   = (q_waypoints[-1] - q_waypoints[-2]) / dt  # (N,) rad/s
+        if qdot_start_override is not None:
+            qdot_start = np.asarray(qdot_start_override, dtype=float)
         if qdot_end_override is not None:
             qdot_end = np.asarray(qdot_end_override, dtype=float)
         try:
